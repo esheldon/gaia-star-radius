@@ -1,0 +1,364 @@
+#!/usr/bin/env python
+import os
+import numpy as np
+import fitsio
+import esutil as eu
+from esutil.pbar import prange
+from esutil.numpy_util import between
+from numba import njit
+import argparse
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--coadd', help='coadd image file', required=True)
+    parser.add_argument('--seg', help='seg file', required=True)
+    parser.add_argument('--gaia-stars', help='gaia stars file', required=True)
+    parser.add_argument('--output', help='output file', required=True)
+    parser.add_argument('--seed', type=int, help='seed for rng', required=True)
+    parser.add_argument('--make-plots', help='make profile plots',
+                        action='store_true')
+
+    return parser.parse_args()
+
+
+def read_image_data(args):
+    """
+    load the image, mask, weight map, seg map and the wcs
+
+    Parameters
+    ----------
+    args: arguments to script
+        From argparse
+
+    Returns
+    -------
+    image, msk, weight, seg, wcs
+    """
+    print('loading coadd data:', args.coadd)
+    with fitsio.FITS(args.coadd) as fits:
+        hdr = fits['sci'].read_header()
+        wcs = eu.wcsutil.WCS(hdr)
+
+        image = fits['sci'].read()
+        msk = fits['msk'].read()
+        weight = fits['wgt'].read()
+
+    print('loading seg:', args.seg)
+    seg = fitsio.read(args.seg)
+    return image, msk, weight, seg, wcs
+
+
+def read_gaia_stars(args, wcs):
+    """
+    read the gaia stars.  Add some extra fields.  This will
+    also be the output
+
+    Parameters
+    -----------
+    args: arguments to script
+        From argparse
+    wcs: wcs object
+        Should have sky2image method
+
+    Returns
+    -------
+    stars: the array
+    """
+    print('loading gaia stars:', args.gaia_stars)
+    stars = fitsio.read(args.gaia_stars, lower=True)
+
+    magmin = 6
+    magmax = 18
+    w, = np.where(
+        between(stars['phot_g_mean_mag'], magmin, magmax)
+    )
+    stars = stars[w]
+
+    add_dt = [('x', 'f8'), ('y', 'f8'), ('radius_pixels', 'f4')]
+    stars = eu.numpy_util.add_fields(stars, add_dt)
+    stars['x'], stars['y'] = wcs.sky2image(stars['ra'], stars['dec'])
+
+    stars['x'] -= 1
+    stars['y'] -= 1
+    stars['radius_pixels'] = -9999
+
+    return stars
+
+
+@njit
+def fill_annulus(
+    objrow, objcol,
+    rmin2, rmax2,
+    image, msk, weight, seg, segval,
+    pix,
+):
+    """
+    fill in pixel values corresponding to the indicated annulus
+
+    The array pix will get a value copied in for each pixel in
+    the annulus
+
+    Only unmasked pixels are used
+
+    Parameters
+    ----------
+    objrow, objcol: float
+        the object row and column
+    rmin2, rmax2: float
+        The square of the minimum and maximum radius for the annulus
+    image: array
+        The image array
+    msk: array
+        The mask array
+    weight: array
+        The weight map array
+    seg: array
+        The seg map array
+    segval: int
+        The seg value corresponding to the object
+    pix: array
+        Array to fill with pixel values.
+
+    Returns
+    -------
+    npix: int
+        The number of pixels found in the annulus
+    """
+    npix = 0
+
+    nrows, ncols = image.shape
+    for row in range(nrows):
+        for col in range(ncols):
+
+            rad2 = (row - objrow)**2 + (col - objcol)**2
+            if rad2 >= rmin2 and rad2 <= rmax2:
+
+                # use pixels identified as this object or not identified
+                this_segval = seg[row, col]
+                if this_segval != 0 and this_segval != segval:
+                    continue
+
+                if msk[row, col] != 0 or weight[row, col] <= 0:
+                    continue
+
+                pix[npix] = image[row, col]
+                npix += 1
+                if npix > pix.size:
+                    raise ValueError('went past')
+    return npix
+
+
+def measure_profile(
+    objrow, objcol, image, msk, weight, seg, pix, binsize,
+    radius, profile, proferr,
+    onesigma,
+):
+    """
+    measure the profile around the object, stopping when two consecutive
+    profile entries are 2 sigma below the noise level, where sigma is
+    the noise on the profile
+
+    Parameters
+    ----------
+    objrow, objcol: float
+        Location of the object
+    image: array
+        The image array
+    msk: array
+        The mask array
+    weight: array
+        The weight map array
+    seg: array
+        The seg map array
+    pix: array
+        Array to fill with pixel values.
+    binsize: float
+        Size of the radial bins
+    radius: array
+        array for profile radius
+    profile: array
+        array for profile
+    proferr: array
+        array for profile error
+    onesigma: float
+        The one-sigma error in the image
+    """
+    radius[:] = 0
+    profile[:] = 0
+    proferr[:] = np.inf
+
+    irow = int(objrow)
+    icol = int(objcol)
+    segval = seg[irow, icol]
+
+    is_below = False
+    for irad in range(radius.size):
+        rmin = irad * binsize
+        rmax = (irad + 1) * binsize
+
+        rmin2 = rmin**2
+        rmax2 = rmax**2
+
+        pix[:] = 0
+        npix = fill_annulus(
+            objrow, objcol, rmin2, rmax2, image, msk, weight, seg, segval, pix,
+        )
+        # print('npix:', npix)
+
+        if npix > 0:
+            radius[irad] = (rmin + rmax) * 0.5
+            profile[irad] = np.median(pix[:npix])
+
+            _, _, err = eu.stat.sigma_clip(pix[:npix], get_err=True)
+            proferr[irad] = err
+            # proferr[irad] = pix[:npix].std()/np.sqrt(npix)
+
+            if profile[irad] + 2 * proferr[irad] < onesigma:
+                if is_below:
+                    # two in a row
+                    break
+                is_below = True
+            else:
+                is_below = False
+
+
+def get_radius(radius, profile, onesigma):
+    """
+    interpolate the profile to get the radius at which it drops to the
+    one sigma noise level
+
+    Parameters
+    ----------
+    radius: array
+        Array representing the radius in pixels
+    profile: array
+        Array representing the profile
+    onesigma: float
+        The one sigma noise level in the image
+
+    Returns
+    -------
+    the interpolated radius
+    """
+    lp = np.log10(profile)
+
+    s = lp.argsort()
+    pval = np.interp(np.log10(onesigma), lp[s], radius[s])
+
+    return pval
+
+
+def plot_profile(stars, istar, radius, profile, proferr, onesigma, plot_dir):
+    """
+    make a plot of the profile
+    """
+    import hickory
+
+    star = stars[istar]
+    mag = star['phot_g_mean_mag']
+    plt = hickory.Plot(
+        title='mag: %g' % mag,
+        xlabel='radius [pixels]',
+        ylabel='profile',
+    )
+    plt.set_yscale('log')
+    plt.errorbar(radius, profile, proferr, linestyle='solid', zorder=2)
+    plt.plot(star['radius_pixels'], onesigma, color='red', zorder=3)
+    plt.axhline(onesigma, zorder=1, color='black')
+
+    fname = os.path.join(
+        plot_dir,
+        'profile-%06d-gmag%.2f.png' % (istar, mag)
+    )
+    plt.savefig(fname)
+
+
+def setup_plotting(args):
+    """
+    setup plotting, including making the directory if needed
+
+    the plot dir is a sub-directory of the directory holding
+    the output
+
+    Returns
+    -------
+    plot_dir
+    """
+    dname = os.path.dirname(args.output)
+    plot_dir = os.path.join(dname, 'profile-plots')
+    if not os.path.exists(plot_dir):
+        try:
+            os.makedirs(plot_dir)
+        except FileExistsError:
+            # probably a race condition
+            pass
+
+    return plot_dir
+
+
+def main():
+    args = get_args()
+
+    if args.make_plots:
+        plot_dir = setup_plotting(args)
+
+    image, msk, weight, seg, wcs = read_image_data(args)
+    stars = read_gaia_stars(args, wcs)
+
+    nrows, ncols = image.shape
+
+    rng = np.random.RandomState(args.seed)
+
+    onesigma = np.sqrt(1/np.median(weight))
+
+    maxrad_arcsec = 800
+    maxrad_pixels = int(np.ceil(maxrad_arcsec / 0.263))
+
+    binsize = 2
+    nbin = int(np.ceil(maxrad_pixels / binsize))
+    print('nbin:', nbin)
+
+    radius = np.zeros(nbin)
+    profile = np.zeros(nbin)
+    proferr = np.zeros(nbin)
+
+    pix = np.zeros(image.size)
+
+    for istar in prange(stars.size):
+        row = stars['y'][istar]
+        col = stars['x'][istar]
+        if row < 0 or col < 0 or row > nrows-1 or col > nrows-1:
+            continue
+
+        if stars['phot_g_mean_mag'][istar] > 16 and rng.uniform() > 0.4:
+            # just do a subset of fainter ones
+            continue
+
+        measure_profile(
+            row, col,
+            image, msk, weight, seg,
+            pix,
+            binsize, radius, profile, proferr,
+            onesigma,
+        )
+        if np.any(radius > 0):
+            w, = np.where(radius > 0)
+
+            # stars['radius_pixels'][istar] = radius[w[-1]]
+            stars['radius_pixels'][istar] = get_radius(
+                radius[w], profile[w], onesigma,
+            )
+
+            if args.make_plots:
+                plot_profile(
+                    stars, istar, radius[w], profile[w], proferr[w], onesigma,
+                    plot_dir,
+                )
+
+    print('writing:', args.output)
+    fitsio.write(args.output, stars, clobber=True)
+
+
+if __name__ == '__main__':
+    main()
