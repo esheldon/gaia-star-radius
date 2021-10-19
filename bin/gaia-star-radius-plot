@@ -4,11 +4,28 @@ import fitsio
 import hickory
 import esutil as eu
 from esutil.numpy_util import between
+import ngmix
+
+
+def get_quantile(bs, logr, quantile):
+
+    nbin = bs['hist'].size
+    qlogr = np.zeros(nbin)
+
+    rev = bs['rev']
+    for i in range(nbin):
+        if rev[i] != rev[i+1]:
+            w = rev[rev[i]:rev[i+1]]
+
+            qlogr[i] = np.quantile(logr[w], quantile)
+
+    return qlogr
 
 
 def main():
     order = 2
-    rng = np.random.RandomState(34132)
+    nbin = 20
+    # rng = np.random.RandomState(34132)
 
     t = fitsio.read('gaia-star-radii.fits', lower=True)
     logr = np.log10(t['radius_pixels'])
@@ -22,10 +39,13 @@ def main():
         nrows=2,
         ncols=2,
     )
+    quantiles = [0.95, 0.99]
+    qcolors = ['orange', 'cyan']
 
     xlabel = 'GAIA G [mag]'
     plys = {}
     for iband, band in enumerate(['r', 'i', 'z']):
+        print('-'*70)
         print(band)
 
         plt = tab.axes[iband]
@@ -50,25 +70,44 @@ def main():
         )
 
         bs = eu.stat.Binner(mag[w], logr[w])
-        bs.dohist(nbin=30, calc_stats=True)
+        bs.dohist(nbin=nbin, calc_stats=True)
 
         # print(bs['hist'])
 
-        coeffs = np.polyfit(bs['xmean'], bs['ymean'], order)
-        ply = np.poly1d(coeffs)
-        print(repr(coeffs))
-        print(ply)
         plt.errorbar(
             bs['xmean'], bs['ymean'], yerr=bs['yerr'], color='black', zorder=1,
         )
 
         xvals = np.linspace(magmin, magmax)
-        plt.curve(xvals, ply(xvals), color='grey', zorder=2, linestyle='solid')
 
+        coeffs = np.polyfit(bs['xmean'], bs['ymean'], order)
+        ply = np.poly1d(coeffs)
+
+        print(f'band: {band} mean')
+        print(ngmix.print_pars(coeffs))
+        plt.curve(xvals, ply(xvals), zorder=3, color='grey')
         plys[band] = ply
 
-        if band != 'r':
-            tab[0, 0].curve(xvals, ply(xvals), zorder=2, alpha=0.4)
+        for quantile, qcolor in zip(quantiles, qcolors):
+            qlogr = get_quantile(bs, logr[w], quantile)
+            plt.plot(
+                bs['xmean'], qlogr, zorder=2, label=f'quantile {quantile:.2f}',
+                color=qcolor,
+            )
+
+            coeffs = np.polyfit(bs['xmean'], qlogr, order)
+            ply = np.poly1d(coeffs)
+            print(f'band: {band} quantile: {quantile:.2f}')
+            print(ngmix.print_pars(coeffs))
+            # print(ply)
+
+            plt.curve(xvals, ply(xvals), zorder=3, color=qcolor)
+
+            # if band != 'r':
+            #     tab[0, 0].curve(xvals, ply(xvals), zorder=3, alpha=0.4)
+
+        if band == 'r':
+            plt.legend()
 
     tab[1, 1].set(xlabel=xlabel, ylabel='poly ratio')
 
